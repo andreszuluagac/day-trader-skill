@@ -445,6 +445,149 @@ class Plans(unittest.TestCase):
         self.assertIn(doc["verdict"] + "\n" + doc["verdict_notes"][0] + "\n" + doc["verdict_notes"][1], text)
 
 
+class Costs(unittest.TestCase):
+    FLAGS = ["run", "--symbol", "TSLA", "--date", "2026-10-19", "--entry", "364.18", "--stop", "358.32",
+             "--target", "370.04", "--entry-time", "10:15 AM", "--offline", TSLA, "--now", NOW]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = machine()
+
+    def mc(self, **kw):
+        return dict({"p_target": 0.4, "p_stop": 0.3, "avg_R": 0.05, "avg_R_net": 0.02, "r_at_target": 1.0,
+                     "r_at_target_net": 0.9, "r_at_stop_net": -1.1}, **kw)
+
+    def test_the_defaults(self):
+        self.assertEqual(self.doc["costs"], {"slippage": 0.02, "commission": 0.0})
+
+    def test_what_a_round_trip_costs(self):
+        for outcome, slip, comm, cost in (("target", 0.02, 0.0, 0.02), ("stop", 0.02, 0.0, 0.04),
+                                          ("close", 0.02, 0.0, 0.04), ("target", 0.02, 0.005, 0.03),
+                                          ("stop", 0.02, 0.005, 0.05), ("close", 0.0, 0.01, 0.02)):
+            self.assertAlmostEqual(tm.cost_per_share(outcome, slip, comm), cost, places=9, msg=outcome)
+
+    def test_the_gross_numbers_do_not_move(self):
+        def gross(doc):
+            return ({k: v for k, v in doc["mc"].items() if "_net" not in k},
+                    [{k: v for k, v in t.items() if k != "net_R"} for t in doc["history"]["trades"]],
+                    doc["verdict"], doc["verdict_notes"])
+        self.assertEqual(gross(machine(replays=2000, slippage=0.5, commission=0.1)),
+                         gross(machine(replays=2000, slippage=0.0, commission=0.0)))
+
+    def test_no_costs_means_net_equals_gross(self):
+        doc = machine(replays=2000, slippage=0.0, commission=0.0)
+        m, h = doc["mc"], doc["history"]
+        self.assertEqual((m["avg_R_net"], m["p_green_net"], m["r_at_target_net"], m["r_at_stop_net"]),
+                         (m["avg_R"], m["p_green"], m["r_at_target"], -1.0))
+        self.assertEqual((h["avg_R_net"], h["green_net"]), (h["avg_R"], h["green"]))
+
+    def test_the_reel_after_costs(self):
+        m, h = self.doc["mc"], self.doc["history"]
+        self.assertEqual((m["avg_R_net"], m["p_green_net"]), (0.028, 0.5137))
+        self.assertEqual((m["r_at_target_net"], m["r_at_stop_net"]), (0.9966, -1.0068))
+        self.assertEqual((h["avg_R_net"], h["green_net"]), (-0.073, 15))
+        self.assertEqual(h["trades"][0]["net_R"], 0.9935)
+        self.assertEqual(self.doc["net_verdict"],
+                         "After costs: Close to a coin flip. The target has to come first in 50.3 % of the replays "
+                         "that hit one side; it did in 53.6 %. Average R +0.028 (+0.034 before costs).")
+
+    def test_every_past_trade_pays_for_its_own_exit(self):
+        trades = machine(replays=100, slippage=0.02, commission=0.01)["history"]["trades"]
+        self.assertEqual({t["outcome"] for t in trades}, {"target", "stop", "close"})
+        for t in trades:
+            cost = (0.04 if t["outcome"] == "target" else 0.06) / (t["entry"] - t["stop"])
+            self.assertAlmostEqual(t["R"] - t["net_R"], cost, places=3, msg=t["date"])
+
+    def test_a_sell_pays_the_same_costs(self):
+        doc = machine(plan(side="sell", stop=370.04, target=358.32, stop_rule="or_high"), replays=2000)
+        m = doc["mc"]
+        self.assertEqual((m["r_at_target_net"], m["r_at_stop_net"]), (0.9966, -1.0068))
+        self.assertLess(m["avg_R_net"], m["avg_R"])
+        for t in doc["history"]["trades"]:
+            self.assertLess(t["net_R"], t["R"], t["date"])
+
+    def test_a_tight_stop_pays_more_in_r(self):
+        m = machine(plan(stop=363.68, target=364.68, stop_rule="pct"), replays=500)["mc"]
+        self.assertEqual((m["r_at_target_net"], m["r_at_stop_net"]), (0.96, -1.08))
+
+    def test_the_net_verdict_moves_the_break_even(self):
+        self.assertEqual(tm.net_verdict(self.mc(p_target=0.4, p_stop=0.3)),
+                         "After costs: Close to a coin flip. The target has to come first in 55.0 % of the replays "
+                         "that hit one side; it did in 57.1 %. Average R +0.020 (+0.050 before costs).")
+        self.assertTrue(tm.net_verdict(self.mc(r_at_target=2.0, r_at_target_net=1.9, p_target=0.25, p_stop=0.5))
+                        .startswith("After costs: Close to break-even."))
+        self.assertTrue(tm.net_verdict(self.mc(p_target=0.2, p_stop=0.6))
+                        .startswith("After costs: Strongly toward the stop."))
+
+    def test_costs_that_flip_the_average_are_called_out(self):
+        for net in (-0.01, 0.0):
+            self.assertIn("The costs take a positive average R to zero or below.",
+                          tm.net_verdict(self.mc(avg_R_net=net)))
+        self.assertNotIn("zero or below", tm.net_verdict(self.mc()))
+        self.assertNotIn("zero or below", tm.net_verdict(self.mc(avg_R=-0.05, avg_R_net=-0.08)))
+
+    def test_costs_that_eat_the_target(self):
+        for win in (0.0, -0.1):
+            self.assertEqual(tm.net_verdict(self.mc(r_at_target_net=win)),
+                             "After costs: the costs eat the whole target. Average R +0.020 (+0.050 before costs).")
+        self.assertIn("eat the whole target", machine(replays=200, slippage=6.0)["net_verdict"])
+
+    def test_no_replay_hit_a_side(self):
+        self.assertEqual(tm.net_verdict(self.mc(p_target=0.0, p_stop=0.0)),
+                         "After costs: Average R +0.020 (+0.050 before costs).")
+
+    def test_the_report_shows_net_next_to_gross(self):
+        text = "\n".join(tm.report(self.doc))
+        for line in ("Average R: +0.034", "After costs: average R +0.028, green 51.4 %",
+                     "+0.997R at the target, -1.007R at the stop", "slippage 0.02 a share", "commission 0 a share",
+                     "Average R -0.062. After costs -0.073.",
+                     "decides those.\n" + self.doc["net_verdict"]):
+            self.assertIn(line, text)
+        for word in ("profit", "P&L", "guarantee", "real time", "tick by tick"):
+            self.assertNotIn(word, text)
+
+    def test_the_report_says_the_replays_are_resampled(self):
+        doc = machine(replays=2000)
+        note = doc["resample_note"]
+        self.assertIn("These 2,000 replays reshuffle the bars of the same 59 real sessions", note)
+        self.assertIn("not 2,000 independent days", note)
+        self.assertIn(note, "\n".join(tm.report(doc)))
+
+    def test_the_flags_reach_the_result(self):
+        code, text, err = run(self.FLAGS + ["--replays", "200", "--slippage", "0.05", "--commission", "0.01", "--json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(text)["costs"], {"slippage": 0.05, "commission": 0.01})
+
+    def test_bad_costs_are_one_plain_line(self):
+        for flag in ("--slippage", "--commission"):
+            for bad in ("-0.01", "nan", "inf"):
+                code, text, err = run(self.FLAGS + [flag, bad])
+                self.assertEqual(code, 1, (flag, bad))
+                self.assertEqual(len(err.strip().splitlines()), 1, err)
+                self.assertTrue(err.startswith("timemachine.py: %s must be zero or more" % flag), err)
+
+    def test_the_chart_shows_the_net_line_and_reads_old_files(self):
+        d = tempfile.mkdtemp()
+        try:
+            out = os.path.join(d, "timemachine.json")
+            self.assertEqual(run(self.FLAGS + ["--replays", "200", "--write", out])[0], 0)
+            with open(out) as fh:
+                old = json.load(fh)
+            code, text, err = run(["chart", "--from", out])
+            self.assertEqual(code, 0, err)
+            self.assertLess(text.index("After costs:"), text.rindex(old["verdict"]))
+            for key in ("net_verdict", "costs", "resample_note"):
+                del old[key]
+            with open(out, "w") as fh:
+                json.dump(old, fh)
+            code, text, err = run(["chart", "--from", out])
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("After costs:", text)
+            self.assertIn("* median", text)
+        finally:
+            shutil.rmtree(d)
+
+
 class Network(unittest.TestCase):
     def setUp(self):
         self.calls, self.sleeps = [], []

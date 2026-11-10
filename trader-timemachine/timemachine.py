@@ -50,6 +50,14 @@ that breaks even at the plan's target R: 1 / (1 + R), so 50 % at 1R and 33 % at
 Below it: a note when more than 40 % of the replays hit neither (the price at
 --until decides those), and the average R when its sign goes against the lean.
 
+Costs: --slippage (USD a share, default 0.02) and --commission (USD a share on
+each side, default 0). The prices, the odds and every gross number above stay as
+they are. The net R takes off what a round trip costs: slippage on the entry and
+on a stop or a time exit (market orders), none on a target (a limit order),
+commission on both sides. A gap through the stop can still cost more than the
+slippage. The replays reshuffle the bars of about 60 real days; they are not that
+many independent days, and the report says so.
+
 5-minute bars only: Yahoo keeps 60 days of 5-min bars but only about 7 days of
 1-min bars, too few sessions for a fair pool. The run refuses with a plain
 message when there are fewer than 20 full sessions or the entry bar is not in
@@ -94,6 +102,8 @@ HIST_BINS = 24
 COIN_FLIP = 0.05     # verdict thresholds, see the docstring
 STRONG = 0.15
 MANY_NEITHER = 0.40
+DEFAULT_SLIPPAGE = 0.02    # USD a share against you: entry, stop and exit at --until (not a limit target)
+DEFAULT_COMMISSION = 0.0   # USD a share on each side (Alpaca charges none)
 EPOCH = datetime.datetime(1970, 1, 1)
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET, from https://www.nyse.com/markets/hours-calendars (read 2026-10-13)
@@ -346,7 +356,14 @@ def pct(a, q):
     return a[min(len(a) - 1, int(q * len(a)))]
 
 
-def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy"):
+def cost_per_share(outcome, slippage, commission):
+    """USD a share one round trip costs: slippage on the entry and on a stop or a time
+    exit (market orders), none on a target (a limit order), commission on both sides."""
+    return slippage + 2 * commission + (0.0 if outcome == "target" else slippage)
+
+
+def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy",
+             slippage=DEFAULT_SLIPPAGE, commission=DEFAULT_COMMISSION):
     """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py."""
     long = side == "buy"
     risk = (entry - stop) if long else (stop - entry)
@@ -389,6 +406,8 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
                 if o == "target" or (o == "close" and (p > entry if long else p < entry)))
     Rs = [r_target if o == "target" else -1.0 if o == "stop" else ((p - entry) if long else (entry - p)) / risk
           for o, p in zip(outcomes, closes)]
+    round_trip = {o: cost_per_share(o, slippage, commission) for o in cnt}
+    net_Rs = [r - round_trip[o] / risk for o, r in zip(outcomes, Rs)]
     srt = sorted(closes)
     # percentile bands per bar for the fan chart: a second run of 2,000 paths, same seed
     rng = random.Random(seed)
@@ -419,6 +438,10 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
         "p_neither": round(cnt["close"] / replays, 4), "p_green": round(green / replays, 4),
         "median_close": round(pct(srt, 0.5), 2), "p5_close": round(pct(srt, 0.05), 2),
         "p95_close": round(pct(srt, 0.95), 2), "avg_R": round(statistics.mean(Rs), 3),
+        "avg_R_net": round(statistics.mean(net_Rs), 3),
+        "p_green_net": round(sum(1 for r in net_Rs if r > 0) / replays, 4),
+        "r_at_target_net": round(r_target - round_trip["target"] / risk, 4),
+        "r_at_stop_net": round(-1.0 - round_trip["stop"] / risk, 4),
         "r_at_target": r_target, "band_paths": BAND_PATHS, "bands": bands, "sample_paths": paths,
         "hist": {"lo": round(lo_, 2), "hi": round(hi_, 2), "bins": bins},
     }
@@ -448,7 +471,7 @@ def rule_stop(rule, oh, ol, entry, long):
     return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long)
 
 
-def history_replay(sessions, rule, last, side="buy"):
+def history_replay(sessions, rule, last, side="buy", slippage=DEFAULT_SLIPPAGE, commission=DEFAULT_COMMISSION):
     """The plan's rule on every past full session: entry = the first bar after the
     opening range to close beyond it (up to the --until bar), then stop first, then
     target, bar by bar, else the close at --until."""
@@ -478,7 +501,8 @@ def history_replay(sessions, rule, last, side="buy"):
         R = ((t - e) if long else (e - t)) / risk if oc == "target" else -1.0 if oc == "stop" else \
             ((cl - e) if long else (e - cl)) / risk
         trades.append({"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "stop": s, "target": t,
-                       "outcome": oc or "close", "R": round(R, 2)})
+                       "outcome": oc or "close", "R": round(R, 2),
+                       "net_R": round(round(R, 2) - cost_per_share(oc or "close", slippage, commission) / risk, 4)})
     return {
         "sessions": len(sessions), "triggered": len(trades),
         "target": sum(1 for x in trades if x["outcome"] == "target"),
@@ -486,6 +510,8 @@ def history_replay(sessions, rule, last, side="buy"):
         "close": sum(1 for x in trades if x["outcome"] == "close"),
         "green": sum(1 for x in trades if x["R"] > 0),
         "avg_R": round(statistics.mean(x["R"] for x in trades), 3) if trades else None,
+        "green_net": sum(1 for x in trades if x["net_R"] > 0),
+        "avg_R_net": round(statistics.mean(x["net_R"] for x in trades), 3) if trades else None,
         "rule": rule, "trades": trades,
     }
 
@@ -639,6 +665,15 @@ def lean(mc):
     return share - even, share, even
 
 
+def _head(d, one_r):
+    """The verdict's words for a gap d, see the docstring for the thresholds."""
+    if abs(d) < COIN_FLIP:
+        return "Close to a coin flip" if one_r else "Close to break-even"
+    if abs(d) < STRONG:
+        return "Leans toward the target" if d > 0 else "Leans toward the stop"
+    return "Strongly toward the target" if d > 0 else "Strongly toward the stop"
+
+
 def verdict(mc):
     """One line from the numbers, see the docstring for the thresholds."""
     pt, ps = mc["p_target"], mc["p_stop"]
@@ -649,12 +684,7 @@ def verdict(mc):
     d, share, even = lv
     r = mc.get("r_at_target") or 1.0
     one_r = abs(r - 1.0) < 0.005
-    if abs(d) < COIN_FLIP:
-        head = "Close to a coin flip" if one_r else "Close to break-even"
-    elif abs(d) < STRONG:
-        head = "Leans toward the target" if d > 0 else "Leans toward the stop"
-    else:
-        head = "Strongly toward the target" if d > 0 else "Strongly toward the stop"
+    head = _head(d, one_r)
     odds = "target first %.1f %% vs stop first %.1f %%" % (100 * pt, 100 * ps)
     if one_r:
         return "%s: %s." % (head, odds)
@@ -676,12 +706,34 @@ def verdict_notes(mc):
     return notes
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
+def net_verdict(mc):
+    """The verdict again after costs, on its own line. The gross verdict stays as it was."""
+    avg, gross = mc["avg_R_net"], mc["avg_R"]
+    tail = "Average R %+.3f (%+.3f before costs)." % (avg, gross)
+    if gross > 0 >= avg:
+        tail += " The costs take a positive average R to zero or below."
+    pt, ps = mc["p_target"], mc["p_stop"]
+    win, loss = mc["r_at_target_net"], -mc["r_at_stop_net"]
+    if pt + ps <= 0:
+        return "After costs: " + tail
+    if win <= 0:
+        return "After costs: the costs eat the whole target. " + tail
+    share, even = pt / (pt + ps), loss / (win + loss)
+    return ("After costs: %s. The target has to come first in %.1f %% of the replays that hit one side; "
+            "it did in %.1f %%. %s" % (_head(share - even, abs(mc["r_at_target"] - 1.0) < 0.005),
+                                       100 * even, 100 * share, tail))
+
+
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo",
+                 slippage=DEFAULT_SLIPPAGE, commission=DEFAULT_COMMISSION):
     """Chart JSON text + a normalized plan -> the timemachine.json document."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
     if not 0 <= window <= 10:
         raise TMError("--window must be between 0 and 10 bars")
+    for name, x in (("--slippage", slippage), ("--commission", commission)):
+        if not 0 <= x < float("inf"):
+            raise TMError("%s must be zero or more dollars a share, got %r" % (name, x))
     sym = plan["symbol"]
     result = chart_result(text, sym)
     meta, bars, dropped = parse_bars(result, now_utc)
@@ -721,7 +773,8 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         raise TMError("only %d full session(s) of %s before %s in the data; the time machine needs at least %d"
                       % (len(sessions), sym, plan["date"], MIN_SESSIONS))
     pool = build_pool(sessions)
-    mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"])
+    mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"],
+                  slippage, commission)
     mc = dict(mc, until=clock24(until_min), pool_sessions=len(sessions), pool_from=sessions[0][0],
               pool_to=sessions[-1][0],
               band_times=[clock24(OPEN_MIN + 5 * (j + 1)) for j in range(k, last + 1)])
@@ -729,7 +782,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     plan_out = {kk: v for kk, v in plan.items() if v is not None}
     if rule:
         plan_out["stop_rule"] = rule["stop_rule"]
-        history = history_replay(sessions, rule, last, plan["side"])
+        history = history_replay(sessions, rule, last, plan["side"], slippage, commission)
     else:
         history = {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [],
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
@@ -747,6 +800,11 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "history": history,
         "verdict": verdict(mc),
         "verdict_notes": verdict_notes(mc),
+        "net_verdict": net_verdict(mc),
+        "costs": {"slippage": slippage, "commission": commission},
+        "resample_note": ("These {:,} replays reshuffle the bars of the same {} real sessions (about 60 days). They "
+                          "are not {:,} independent days: more replays smooth the numbers, they add no new "
+                          "evidence.".format(replays, len(sessions), replays)),
         "warnings": warn,
         "note": ("A simulation built from %s's own last %d full sessions. It is not a prediction: earnings, "
                  "news and halts can do things those sessions never did. Same seed, same numbers." % (sym, len(sessions))),
@@ -773,6 +831,7 @@ def report(doc):
         % ("{:,}".format(m["replays"]), p["entry_time"], until, m["bars_left"], m["seed"]),
         "Each bar is drawn whole from %s's own 5-min bars at the same time of day (+-%d bars) over its last "
         "%d full sessions (%s to %s)." % (p["symbol"], m["window"], m["pool_sessions"], m["pool_from"], m["pool_to"]),
+        doc["resample_note"],
         "",
         "  target first   %s" % pc(m["p_target"]),
         "  stop first     %s" % pc(m["p_stop"]),
@@ -784,6 +843,10 @@ def report(doc):
         % (until, m["median_close"], m["p5_close"], m["p95_close"]),
         "  Average R: %+.3f (R = the %.2f risk: %sR at the target, -1R at the stop)."
         % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]), ),
+        "  After costs: average R %+.3f, green %s (%+.3fR at the target, %+.3fR at the stop; slippage %g a share on "
+        "the entry, the stop and a time exit, commission %g a share each side)."
+        % (m["avg_R_net"], pc(m["p_green_net"]), m["r_at_target_net"], m["r_at_stop_net"],
+           doc["costs"]["slippage"], doc["costs"]["commission"]),
         "",
     ]
     if h.get("rule"):
@@ -793,14 +856,15 @@ def report(doc):
                                                            "%.2f %% from the entry" % ru.get("stop_pct", 0))
         if h["triggered"]:
             lines.append("History: the same rule (%d-min opening range, stop at the %s, %gR target) on each of "
-                         "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R %+.3f."
+                         "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R %+.3f. "
+                         "After costs %+.3f."
                          % (ru["or_minutes"], stop_words, ru["target_r"], h["sessions"], h["triggered"],
-                            h["target"], h["stop"], h["close"], h["avg_R"]))
+                            h["target"], h["stop"], h["close"], h["avg_R"], h["avg_R_net"]))
         else:
             lines.append("History: the same rule never fired in those %d sessions." % h["sessions"])
     else:
         lines.append("History: " + h.get("note", "skipped."))
-    lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or []) + [""]
+    lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or []) + [doc["net_verdict"], ""]
     for w in doc.get("warnings") or []:
         lines.append("Note: " + w + ".")
     if doc["data"]["short_sessions_left_out"]:
@@ -874,7 +938,7 @@ def compute(a):
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
+    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, a.slippage, a.commission)
 
 
 def cmd_run(a):
@@ -905,7 +969,8 @@ def cmd_chart(a):
     else:
         doc = compute(a)
     print("\n".join(render_chart(doc)))
-    print("\n".join([doc.get("verdict", "")] + list(doc.get("verdict_notes") or [])))
+    net = [doc["net_verdict"]] if doc.get("net_verdict") else []     # absent in a file saved before costs existed
+    print("\n".join(net + [doc.get("verdict", "")] + list(doc.get("verdict_notes") or [])))
     return 0
 
 
@@ -929,6 +994,10 @@ def main(argv=None):
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
         p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
+        p.add_argument("--slippage", type=float, default=DEFAULT_SLIPPAGE, metavar="USD",
+                       help="USD a share against you on the entry, the stop and an exit at --until (default 0.02)")
+        p.add_argument("--commission", type=float, default=DEFAULT_COMMISSION, metavar="USD",
+                       help="USD a share on each side (default 0)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
 
